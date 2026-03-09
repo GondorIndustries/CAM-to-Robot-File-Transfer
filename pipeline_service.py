@@ -2,12 +2,12 @@
 """
 IRC5 Auto-Deploy Pipeline
 =========================
-Watches a local inbox folder (kept in sync with Google Drive via rclone)
-for new Fusion 360 RAPID exports, splits them automatically, then uploads
-to the ABB IRC5 controller via FTP whenever the controller is powered on.
+Watches the Google Drive inbox folder for new Fusion 360 RAPID exports,
+splits them automatically, then uploads to the ABB IRC5 controller via FTP
+whenever the controller is powered on.
 
-FIRST-TIME SETUP
-  Run setup_gdrive.bat once to install rclone and configure Google Drive.
+Google Drive for Desktop keeps the G: drive in sync automatically — no
+rclone or manual transfers needed.
 
 DAILY USE
   Double-click start_pipeline.bat — it keeps this script running.
@@ -32,7 +32,6 @@ import json
 import ftplib
 import logging
 import datetime
-import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -40,17 +39,14 @@ from logging.handlers import RotatingFileHandler
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR        = Path(__file__).parent.resolve()
-RCLONE_EXE        = SCRIPT_DIR / "rclone.exe"
-LOCAL_INBOX       = SCRIPT_DIR / "inbox"
-LOCAL_PROCESSED   = SCRIPT_DIR / "processed"
 SPLIT_OUTPUT_BASE = SCRIPT_DIR / "split_output"
 STATE_FILE        = SCRIPT_DIR / "state.json"
 LOG_FILE          = SCRIPT_DIR / "pipeline.log"
 
-# Google Drive remote name (set during rclone config in setup_gdrive.bat)
-# and the folder path inside your Drive where the programmer drops files.
-GDRIVE_REMOTE     = "gdrive:RobotInbox/Inbox"
-GDRIVE_ARCHIVE    = "gdrive:RobotInbox/Processed"
+# Google Drive for Desktop mounts as G: — inbox folder watched directly.
+# Processed files are moved to the Processed subfolder on Drive.
+LOCAL_INBOX       = Path("G:/My Drive/RobotInbox/Inbox")
+LOCAL_PROCESSED   = Path("G:/My Drive/RobotInbox/Processed")
 
 # IRC5 connection
 IRC5_HOST         = "192.168.125.1"
@@ -63,7 +59,6 @@ MAX_TARGETS       = 25_000      # max Move targets per part file
 
 # Timing (seconds)
 POLL_INTERVAL         = 30      # main loop sleep
-RCLONE_SYNC_INTERVAL  = 60      # how often to pull from Google Drive
 FILE_STABLE_CHECKS    = 3       # stability: check file size this many times
 FILE_STABLE_SLEEP     = 4       # seconds between size checks (3×4 = 12s total)
 
@@ -465,38 +460,6 @@ def upload_job(job):
         return False
 
 
-# ── RCLONE SYNC ───────────────────────────────────────────────────────────────
-
-def run_rclone_sync():
-    if not RCLONE_EXE.exists():
-        log.warning(f"rclone.exe not found at {RCLONE_EXE} — skipping GDrive sync. "
-                    f"Run setup_gdrive.bat to install it.")
-        return False
-    try:
-        result = subprocess.run(
-            [str(RCLONE_EXE), "copy",
-             GDRIVE_REMOTE, str(LOCAL_INBOX),
-             "--no-traverse",
-             "--transfers", "4",
-             "--log-level", "ERROR"],
-            capture_output=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            log.debug("rclone sync OK")
-            return True
-        else:
-            err = result.stderr.decode("utf-8", errors="replace").strip()
-            log.warning(f"rclone exited {result.returncode}: {err[:300]}")
-            return False
-    except subprocess.TimeoutExpired:
-        log.warning("rclone sync timed out after 120s")
-        return False
-    except Exception as e:
-        log.warning(f"rclone error: {e}")
-        return False
-
-
 def archive_inbox_set(pgf_stem, mod_paths, pgf_path):
     """Move processed inbox files to local processed folder."""
     dest = LOCAL_PROCESSED / pgf_stem
@@ -515,36 +478,22 @@ def archive_inbox_set(pgf_stem, mod_paths, pgf_path):
 def main():
     setup_logging()
 
-    LOCAL_INBOX.mkdir(parents=True, exist_ok=True)
-    LOCAL_PROCESSED.mkdir(parents=True, exist_ok=True)
     SPLIT_OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 60)
     log.info("IRC5 Auto-Deploy Pipeline")
     log.info(f"  Inbox    : {LOCAL_INBOX}")
-    log.info(f"  GDrive   : {GDRIVE_REMOTE}")
     log.info(f"  IRC5     : {IRC5_HOST}:{IRC5_FTP_PORT}")
     log.info("=" * 60)
 
-    if not RCLONE_EXE.exists():
-        log.warning("rclone.exe not found — GDrive sync disabled. "
-                    "Run setup_gdrive.bat to enable it. "
-                    "You can still drop files manually into the inbox folder.")
+    if not LOCAL_INBOX.exists():
+        log.warning(f"Inbox folder not found: {LOCAL_INBOX}")
+        log.warning("Make sure Google Drive for Desktop is running and the G: drive is mounted.")
 
     state = load_state()
-    last_sync = 0
 
     while True:
-        now = time.monotonic()
-
-        # ── 1. Sync from Google Drive ──────────────────────────────────────
-        if now - last_sync >= RCLONE_SYNC_INTERVAL:
-            if run_rclone_sync():
-                last_sync = now
-                state["last_rclone_sync"] = datetime.datetime.now().isoformat()
-                save_state(state)
-
-        # ── 2. Detect and split new programs ──────────────────────────────
+        # ── 1. Detect and split new programs ──────────────────────────────
         ready_sets = scan_inbox(state)
         for program_set in ready_sets:
             stem = program_set["pgf_stem"]
