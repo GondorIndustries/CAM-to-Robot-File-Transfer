@@ -1,0 +1,27 @@
+# Large robot program files — not tracked in git
+*.mod
+*.pgf
+*.stl
+
+# Pipeline working folders
+inbox/
+processed/
+split_output/
+
+# Pipeline state and logs
+state.json
+state.tmp
+pipeline.log
+pipeline.log.*
+
+# rclone binary
+rclone.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+*.swp
