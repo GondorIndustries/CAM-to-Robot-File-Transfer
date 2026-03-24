@@ -138,7 +138,7 @@ start_pipeline.bat
 
 ### 4. Google Drive folder
 
-The inbox folder (`G:\My Drive\RobotInbox\Inbox`) is already shared. Google Drive for Desktop will sync it to the `G:` drive once you sign in. No further Google Drive setup is needed on a new machine.
+The inbox folder (`G:\My Drive\RobotInbox\Inbox`) is already shared — [open it here](https://drive.google.com/drive/folders/1Rc0PNUIUISWZSZsuzQ-vMAioOVy3m47F?usp=drive_link). Google Drive for Desktop will sync it to the `G:` drive once you sign in. No further Google Drive setup is needed on a new machine.
 
 ---
 
