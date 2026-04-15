@@ -27,11 +27,55 @@ from pathlib import Path
 # Controller path prefix — files are uploaded to HOME:/<output_dir_name>/
 CONTROLLER_BASE = "HOME:/"
 
-# Transit block machinery removed — between-step safe-area handling now lives
-# entirely in the per-step prologue/epilogue injected by postprocess.py
-# (scSafeArrive / scSafeDepart), so combine_steps.py no longer injects any
-# moves between steps.  Combined main is a plain sequential Load → Execute →
-# UnLoad.
+# Between-step transitions use scSafeZone.mod (scSafeDepart / scSafeArrive).
+# The combiner injects calls to these procs between consecutive steps.
+# No hardcoded transit moves — all motion logic lives in scSafeZone.mod.
+#
+# scSafeDepart(tool, wobj): lift z=50, lift z=655, MoveAbsJ to safe home
+# scSafeArrive(tool, wobj, homeJoints, firstCut): wrist reconfig at safe area,
+#   descend to 655, MoveJ to z=50 above first cut
+
+
+def _extract_first_cartesian_move(content):
+    """Return the first MoveL or MoveJ (Cartesian target) line from *content*."""
+    m = re.search(r"^\s*(Move[LJ]\s+\[\[.+;)", content, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _extract_first_moveabsj(content):
+    """Return the first MoveAbsJ instruction line (stripped) from *content*."""
+    m = re.search(r"^\s*(MoveAbsJ\s+.+;)", content, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _extract_robtarget(move_line):
+    """Extract the robtarget portion from a MoveL/MoveJ line.
+
+    Returns the [[pos],[orient],[confdata],[extax]] string.
+    """
+    m = re.search(r"(\[\[[^\]]+\](?:,\[[^\]]+\]){3}\])", move_line)
+    return m.group(1) if m else None
+
+
+def _extract_jointtarget(moveabsj_line):
+    """Extract the jointtarget portion from a MoveAbsJ line.
+
+    Returns the [[rax],[eax]] string.
+    """
+    m = re.search(r"(\[\[[^\]]+\],\[[^\]]+\]\])", moveabsj_line)
+    return m.group(1) if m else None
+
+
+def _extract_tool_wobj(move_line):
+    """Extract tool name and optional wobj name from a RAPID move line."""
+    wobj_m = re.search(r"\\WObj:=(\w+)", move_line)
+    wobj = wobj_m.group(1) if wobj_m else None
+    if wobj:
+        tool_m = re.search(r",(\w+)\\WObj", move_line)
+    else:
+        tool_m = re.search(r",(\w+);", move_line)
+    tool = tool_m.group(1) if tool_m else "tADSK2"
+    return tool, wobj
 
 
 def read_file(path):
@@ -192,11 +236,28 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
     lines.append("    ConfL\\Off;\n")
     lines.append("    !\n")
 
-    # Load/UnLoad blocks for each step — plain sequential, no injected moves.
-    # Between-step safe-area handling lives in the per-step prologue/epilogue
-    # (scSafeArrive / scSafeDepart) injected by postprocess.py.
+    # Load/UnLoad blocks for each step with scSafeDepart/scSafeArrive
+    # between consecutive steps.
+    prev_step_info = None
     for step_info in step_infos:
         step_name = step_info["name"]
+
+        # Inject safe-area transition between consecutive steps
+        if prev_step_info is not None:
+            prev_tool = prev_step_info.get("tool", "tADSK2")
+            prev_wobj = prev_step_info.get("wobj", "wobj0")
+            next_tool = step_info.get("tool", "tADSK2")
+            next_wobj = step_info.get("wobj", "wobj0")
+            next_home = step_info.get("home_jointtarget", "")
+            next_first_cut = step_info.get("first_robtarget", "")
+
+            lines.append("    !\n")
+            lines.append(f"    ! --- Safe area transition: {prev_step_info['name']} -> {step_name} ---\n")
+            lines.append(f"    scSafeDepart {prev_tool}, {prev_wobj};\n")
+            lines.append(f"    scSafeArrive {next_tool}, {next_wobj}, {next_home}, {next_first_cut};\n")
+            lines.append(f"    ! --- End safe area transition ---\n")
+            lines.append("    !\n")
+
         lines.append(f"    ! ===== {step_name} =====\n")
         for block in step_info["load_blocks"]:
             mod_file = block["mod_filename"]
@@ -207,6 +268,7 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
             lines.append(f'    UnLoad "{full_path}";\n')
             lines.append(f"    !\n")
         lines.append("    !\n")
+        prev_step_info = step_info
 
     # Cleanup
     lines.append("    ! Reset and stop\n")
@@ -227,12 +289,13 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
 
 
 def build_pgf(main_mod_name):
-    """Build .pgf that references only the main module + SpeedController."""
+    """Build .pgf that references main module + SpeedController + scSafeZone."""
     lines = []
     lines.append('<?xml version="1.0" encoding="ISO-8859-1"?>\n')
     lines.append("<Program>\n")
     lines.append(f"  <Module>{main_mod_name}.mod</Module>\n")
     lines.append("  <Module>SpeedController.mod</Module>\n")
+    lines.append("  <Module>scSafeZone.mod</Module>\n")
     lines.append("</Program>\n")
     return "".join(lines)
 
@@ -358,10 +421,29 @@ def main():
 
         all_pers.extend(parsed["pers_lines"])
 
+        # Extract tool/wobj/home/first-cut from part01 for scSafeArrive
+        tool_name = "tADSK2"
+        wobj_name = "wobj0"
+        home_jointtarget = ""
+        first_robtarget = ""
+        if part_files:
+            part01_content = read_file(str(part_files[0]))
+            first_cart = _extract_first_cartesian_move(part01_content)
+            first_absj = _extract_first_moveabsj(part01_content)
+            if first_cart:
+                tool_name, wobj_name = _extract_tool_wobj(first_cart)
+                first_robtarget = _extract_robtarget(first_cart) or ""
+            if first_absj:
+                home_jointtarget = _extract_jointtarget(first_absj) or ""
+
         step_info = {
             "name": step_dir.name.replace("_split", ""),
             "load_blocks": parsed["load_blocks"],
             "part_files": part_files,
+            "tool": tool_name,
+            "wobj": wobj_name or "wobj0",
+            "home_jointtarget": home_jointtarget,
+            "first_robtarget": first_robtarget,
         }
         step_infos.append(step_info)
         all_part_files.extend(part_files)
@@ -370,6 +452,7 @@ def main():
         print(f"    Main module: {main_file.name}")
         print(f"    Part files: {len(part_files)}")
         print(f"    Load blocks: {len(parsed['load_blocks'])}")
+        print(f"    Tool/wobj: {tool_name} / {wobj_name or 'wobj0'}")
 
     # Check for wobj conflicts
     wobj_names = set()
@@ -423,6 +506,14 @@ def main():
             print(f"    SpeedController.mod (from spindle-modbus-robot)")
         else:
             print(f"    WARNING: SpeedController.mod not found!")
+
+    # Copy scSafeZone.mod
+    sz_source = Path(__file__).parent.parent / "spindle-modbus-robot" / "scSafeZone.mod"
+    if sz_source.exists():
+        shutil.copy(sz_source, output_dir / "scSafeZone.mod")
+        print(f"    scSafeZone.mod")
+    else:
+        print(f"    WARNING: scSafeZone.mod not found at {sz_source}!")
 
     # Build combined main module
     print(f"\n  Building combined main module: {output_name}.mod")
