@@ -32,9 +32,13 @@ import json
 import ftplib
 import logging
 import datetime
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+
+# Path to spindle-modbus-robot postprocessor
+POSTPROCESS_SCRIPT = Path(__file__).parent.parent / "spindle-modbus-robot" / "postprocess.py"
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
@@ -340,23 +344,156 @@ def scan_inbox(state):
     return ready
 
 
-# ── SPLITTING ─────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
-def run_split(program_set):
+def count_targets(mod_path):
+    """Count Move instructions in a .mod file using MOVE_RE."""
+    lines = _read_lines(mod_path)
+    return sum(1 for l in lines if MOVE_RE.match(l))
+
+
+# ── SPLITTING / PROCESSING ───────────────────────────────────────────────────
+
+def _copy_files_to_output(output_dir, pgf_path, mod_paths):
+    """Copy original .pgf and .mod files into output_dir."""
+    import shutil
+    for src in [pgf_path] + mod_paths:
+        shutil.copy2(src, output_dir / src.name)
+
+
+def _run_postprocessor(output_dir):
+    """Run spindle-modbus-robot postprocess.py on the output directory.
+
+    Injects speed control hooks, move counters, water jet commands,
+    copies SpeedController.mod, and rebuilds the .pgf file.
+
+    Raises RuntimeError if postprocessing fails — prevents uploading
+    unprocessed files to the controller.
+    """
+    if not POSTPROCESS_SCRIPT.exists():
+        raise RuntimeError(f"Postprocessor not found at {POSTPROCESS_SCRIPT}")
+
+    log.info(f"  Running postprocessor on {output_dir.name}...")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(POSTPROCESS_SCRIPT), str(output_dir)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            log.info(f"  Postprocessor OK:\n{result.stdout}")
+            return True
+        else:
+            raise RuntimeError(
+                f"Postprocessor failed (exit {result.returncode}):\n{result.stderr}\n{result.stdout}"
+            )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Postprocessor timed out on {output_dir.name}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Postprocessor error: {e}")
+
+
+def process_program(program_set):
+    """Process a program set: copy as-is if small, split if large."""
     stem          = program_set["pgf_stem"]
     pgf_path      = program_set["pgf_path"]
     mod_paths     = program_set["mod_paths"]
+    num_mods      = len(mod_paths)
+
+    # ── Determine target counts per module ────────────────────────────────
+    mod_target_counts = {p: count_targets(p) for p in mod_paths}
+    total_targets = sum(mod_target_counts.values())
+
+    # ── Single .mod file ──────────────────────────────────────────────────
+    if num_mods == 1:
+        if total_targets <= MAX_TARGETS:
+            # Small single-file program — copy as-is
+            log.info(f"  {stem}: {total_targets:,} targets \u2192 no split needed")
+            output_dir = SPLIT_OUTPUT_BASE / stem
+            ctrl_path  = f"HOME:/{stem}/"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _copy_files_to_output(output_dir, pgf_path, mod_paths)
+            _run_postprocessor(output_dir)
+            files_to_upload = [f.name for f in sorted(output_dir.iterdir()) if f.is_file()]
+            return {
+                "job_id":            make_job_id(stem),
+                "pgf_stem":          stem,
+                "status":            "pending_upload",
+                "created_at":        datetime.datetime.now().isoformat(),
+                "split_output_dir":  str(output_dir),
+                "files_to_upload":   files_to_upload,
+                "ftp_remote_dir":    stem,
+                "controller_path":   ctrl_path,
+                "split":             False,
+                "upload_attempts":   0,
+                "last_attempt_at":   None,
+                "completed_at":      None,
+                "error":             None,
+            }
+        else:
+            # Large single-file program — copy as-is but warn
+            log.warning(f"  {stem}: {total_targets:,} targets in a single .mod file — "
+                        f"copying as-is but manual splitting may be needed")
+            output_dir = SPLIT_OUTPUT_BASE / stem
+            ctrl_path  = f"HOME:/{stem}/"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _copy_files_to_output(output_dir, pgf_path, mod_paths)
+            _run_postprocessor(output_dir)
+            files_to_upload = [f.name for f in sorted(output_dir.iterdir()) if f.is_file()]
+            return {
+                "job_id":            make_job_id(stem),
+                "pgf_stem":          stem,
+                "status":            "pending_upload",
+                "created_at":        datetime.datetime.now().isoformat(),
+                "split_output_dir":  str(output_dir),
+                "files_to_upload":   files_to_upload,
+                "ftp_remote_dir":    stem,
+                "controller_path":   ctrl_path,
+                "split":             False,
+                "upload_attempts":   0,
+                "last_attempt_at":   None,
+                "completed_at":      None,
+                "error":             None,
+            }
+
+    # ── Two .mod files ────────────────────────────────────────────────────
+    # Identify movement module (largest) and main module (smaller)
+    sorted_mods = sorted(mod_paths, key=lambda p: p.stat().st_size, reverse=True)
+    movement_mod_path = sorted_mods[0]
+    main_mod_path     = sorted_mods[1]
+    movement_targets  = mod_target_counts[movement_mod_path]
+
+    if movement_targets <= MAX_TARGETS:
+        # Small two-file program — copy as-is
+        log.info(f"  {stem}: {movement_targets:,} targets \u2192 no split needed")
+        output_dir = SPLIT_OUTPUT_BASE / stem
+        ctrl_path  = f"HOME:/{stem}/"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _copy_files_to_output(output_dir, pgf_path, mod_paths)
+        _run_postprocessor(output_dir)
+        files_to_upload = [f.name for f in sorted(output_dir.iterdir()) if f.is_file()]
+        return {
+            "job_id":            make_job_id(stem),
+            "pgf_stem":          stem,
+            "status":            "pending_upload",
+            "created_at":        datetime.datetime.now().isoformat(),
+            "split_output_dir":  str(output_dir),
+            "files_to_upload":   files_to_upload,
+            "ftp_remote_dir":    stem,
+            "controller_path":   ctrl_path,
+            "split":             False,
+            "upload_attempts":   0,
+            "last_attempt_at":   None,
+            "completed_at":      None,
+            "error":             None,
+        }
+
+    # ── Large movement module — split ─────────────────────────────────────
     output_dir    = SPLIT_OUTPUT_BASE / f"{stem}_split"
     ctrl_path     = f"HOME:/{stem}_split/"
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Identify movement module (largest) and main module (smaller)
-    sorted_mods = sorted(mod_paths, key=lambda p: p.stat().st_size, reverse=True)
-    if len(sorted_mods) < 2:
-        raise ValueError(f"Expected at least 2 .mod files for '{stem}', got {len(sorted_mods)}")
-    movement_mod_path = sorted_mods[0]
-    main_mod_path     = sorted_mods[1]
 
     mov_lines  = _read_lines(movement_mod_path)
     back_lines = _read_lines(main_mod_path)
@@ -372,7 +509,7 @@ def run_split(program_set):
     chunks = _chunk_body(body)
     n = len(chunks)
 
-    log.info(f"  Splitting '{base_mod_name}': {total_targets:,} targets → {n} parts")
+    log.info(f"  {stem}: {total_targets:,} targets \u2192 splitting into {n} parts")
 
     mod_names  = [f"{base_mod_name}_part{i+1:02d}" for i in range(n)]
     proc_names = [f"{orig_proc_name}_part{i+1:02d}" for i in range(n)]
@@ -392,8 +529,9 @@ def run_split(program_set):
     pgf_out = _build_pgf(main_mod_name)
     _write_file(output_dir / pgf_path.name, pgf_out)
 
-    log.info(f"  Split complete → {output_dir.name}  ({n} parts, controller path: {ctrl_path})")
+    log.info(f"  Split complete \u2192 {output_dir.name}  ({n} parts, controller path: {ctrl_path})")
 
+    _run_postprocessor(output_dir)
     files_to_upload = [f.name for f in sorted(output_dir.iterdir()) if f.is_file()]
 
     return {
@@ -405,6 +543,8 @@ def run_split(program_set):
         "files_to_upload":   files_to_upload,
         "ftp_remote_dir":    f"{stem}_split",
         "controller_path":   ctrl_path,
+        "split":             True,
+        "parts_count":       n,
         "upload_attempts":   0,
         "last_attempt_at":   None,
         "completed_at":      None,
@@ -499,14 +639,14 @@ def main():
             stem = program_set["pgf_stem"]
             log.info(f"Processing: {stem}")
             try:
-                job = run_split(program_set)
+                job = process_program(program_set)
                 state["queue"].append(job)
                 state["processed_pgf_stems"].append(stem)
                 save_state(state)
                 archive_inbox_set(stem, program_set["mod_paths"], program_set["pgf_path"])
                 log.info(f"Queued for upload: {stem}")
             except Exception as e:
-                log.error(f"Split failed for '{stem}': {e}", exc_info=True)
+                log.error(f"Processing failed for '{stem}': {e}", exc_info=True)
                 # Don't add to processed_pgf_stems — allow retry after fixing
 
         # ── 3. Upload pending jobs when IRC5 is online ────────────────────
@@ -528,6 +668,8 @@ def main():
                         job["completed_at"] = datetime.datetime.now().isoformat()
                         log.info(f"DONE: '{job['pgf_stem']}' is on the controller at "
                                  f"HOME:/{job['ftp_remote_dir']}/")
+                        log.info(f"TIP: To combine multiple steps into one program, run:")
+                        log.info(f"  python combine_steps.py split_output/StepA_split split_output/StepB_split --output split_output/Combined_split")
                     else:
                         job["status"] = "pending_upload"  # will retry next cycle
                         log.warning(f"Upload failed for '{job['pgf_stem']}' — will retry.")
