@@ -25,6 +25,12 @@ import json
 import shutil
 from pathlib import Path
 
+# Import the canonical speed-control templates from postprocess.py so we
+# stay in sync with the current architecture (lightweight trap, watchdog,
+# hysteresis, etc.) instead of maintaining a stale duplicate inline.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "spindle-modbus-robot"))
+from postprocess import ITIMER_SETUP, TRAP_BLOCK  # noqa: E402
+
 # Controller path prefix — files are uploaded to HOME:/<output_dir_name>/
 CONTROLLER_BASE = "HOME:/"
 
@@ -235,23 +241,22 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
     lines.append(f"MODULE {output_name}\n")
 
     # Declarations
+    # NOTE: We do NOT declare g_*, speedInt, g_cpuClock here. Those live in
+    # SpeedController.mod (the T_ROB1 PERS master, system-loaded via
+    # CAB_TASK_MODULES at boot). Re-declaring them here would cause
+    # ambiguous-symbol errors. See docs/ARCHITECTURE_AND_CONVENTIONS.md.
     for p in pers_lines:
         lines.append(f"{p}\n")
-    lines.append("  VAR intnum speedInt;\n")
     lines.append("\n")
 
     # PROC main()
     lines.append("  PROC main()\n")
 
-    # Speed control setup
-    lines.append("        g_speedPct := 100;\n")
-    lines.append("        g_moveCount := 0;\n")
-    lines.append("        SetDO doWaterJet, 1;\n")
-    lines.append("        IDelete speedInt;\n")
-    lines.append("        CONNECT speedInt WITH SpeedTrap;\n")
-    lines.append("        ITimer 0.15, speedInt;\n")
-    lines.append("        VelSet g_speedPct, 5000;\n")
-    lines.append("        scConnect;\n")
+    # Speed-control setup - imported verbatim from postprocess.py so the
+    # combined program inherits the current architecture (ITimer 0.1-0.2s,
+    # lightweight trap, watchdog, heartbeat, etc.) automatically when
+    # postprocess.py is updated. No duplicate template to keep in sync.
+    lines.append(ITIMER_SETUP)
 
     # Robot setup
     lines.append("    !\n")
@@ -304,11 +309,10 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
     lines.append("    Stop;\n")
     lines.append("  ENDPROC\n")
 
-    # SpeedTrap
-    lines.append("    TRAP SpeedTrap\n")
-    lines.append("        scExchange;\n")
-    lines.append("        VelSet g_speedPct, 5000;\n")
-    lines.append("    ENDTRAP\n")
+    # TRAP - imported from postprocess.py so the lightweight trap with
+    # hysteresis + watchdog + heartbeat stays in sync with the current
+    # architecture. No more inline duplicate.
+    lines.append(TRAP_BLOCK)
     lines.append("\n")
     lines.append("ENDMODULE\n")
 
@@ -316,12 +320,18 @@ def build_combined_main(output_name, controller_path, pers_lines, step_infos):
 
 
 def build_pgf(main_mod_name):
-    """Build .pgf that references main module + SpeedController + scSafeZone."""
+    """Build .pgf that references main module + scSafeZone.
+
+    SpeedController.mod is NOT included: it is system-loaded into T_ROB1 via
+    CAB_TASK_MODULES at boot from HOME:/SpeedController.mod and survives all
+    .pgf reloads. Including it here would cause `SpeedController#1`/`#2`
+    duplicate-module errors when reloading the program from the pendant.
+    See docs/ARCHITECTURE_AND_CONVENTIONS.md.
+    """
     lines = []
     lines.append('<?xml version="1.0" encoding="ISO-8859-1"?>\n')
     lines.append("<Program>\n")
     lines.append(f"  <Module>{main_mod_name}.mod</Module>\n")
-    lines.append("  <Module>SpeedController.mod</Module>\n")
     lines.append("  <Module>scSafeZone.mod</Module>\n")
     lines.append("</Program>\n")
     return "".join(lines)
@@ -515,24 +525,11 @@ def main():
         shutil.copy(pf, dest)
         print(f"    {pf.name}")
 
-    # Copy SpeedController.mod
-    sc_source = None
-    for step_dir in step_dirs:
-        sc = step_dir / "SpeedController.mod"
-        if sc.exists():
-            sc_source = sc
-            break
-    if sc_source:
-        shutil.copy(sc_source, output_dir / "SpeedController.mod")
-        print(f"    SpeedController.mod")
-    else:
-        # Try from spindle-modbus-robot
-        sc_fallback = Path(__file__).parent.parent / "spindle-modbus-robot" / "SpeedController.mod"
-        if sc_fallback.exists():
-            shutil.copy(sc_fallback, output_dir / "SpeedController.mod")
-            print(f"    SpeedController.mod (from spindle-modbus-robot)")
-        else:
-            print(f"    WARNING: SpeedController.mod not found!")
+    # NOTE: We deliberately DO NOT bundle SpeedController.mod into the
+    # combined output anymore. It is system-loaded into T_ROB1 via
+    # CAB_TASK_MODULES from HOME:/SpeedController.mod at boot. Bundling it
+    # here was the cause of `SpeedController#1`/`#2` duplicate-module errors
+    # at pendant reload. See docs/ARCHITECTURE_AND_CONVENTIONS.md.
 
     # Copy scSafeZone.mod
     sz_source = Path(__file__).parent.parent / "spindle-modbus-robot" / "scSafeZone.mod"
